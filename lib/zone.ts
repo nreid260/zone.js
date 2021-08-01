@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright Google Inc. All Rights Reserved.
+ * Copyright Google LLC All Rights Reserved.
  *
  * Use of this source code is governed by an MIT-style license that can be
  * found in the LICENSE file at https://angular.io/license
@@ -223,9 +223,9 @@ interface Zone {
    * @param task to run
    * @param applyThis
    * @param applyArgs
-   * @returns {*}
+   * @returns {any} Value from the `task.callback` function.
    */
-  runTask(task: Task, applyThis?: any, applyArgs?: any): any;
+  runTask<T>(task: Task, applyThis?: any, applyArgs?: any): T;
 
   /**
    * Schedule a MicroTask.
@@ -309,17 +309,27 @@ interface ZoneType {
    */
   root: Zone;
 
-  /** @internal */
-  __load_patch(name: string, fn: _PatchFn): void;
+  /**
+   * load patch for specified native module, allow user to
+   * define their own patch, user can use this API after loading zone.js
+   */
+  __load_patch(name: string, fn: _PatchFn, ignoreDuplicate?: boolean): void;
 
-  /** Was @ internal but this prevents compiling tests as separate unit */
+  /**
+   * Zone symbol API to generate a string with __zone_symbol__ prefix
+   */
   __symbol__(name: string): string;
 }
 
-/** @internal */
+/**
+ * Patch Function to allow user define their own monkey patch module.
+ */
 type _PatchFn = (global: Window, Zone: ZoneType, api: _ZonePrivate) => void;
 
-/** @internal */
+/**
+ * _ZonePrivate interface to provide helper method to help user implement
+ * their own monkey patch module.
+ */
 interface _ZonePrivate {
   currentZoneFrame: () => _ZoneFrame;
   symbol: (name: string) => string;
@@ -327,10 +337,9 @@ interface _ZonePrivate {
   onUnhandledError: (error: Error) => void;
   microtaskDrainDone: () => void;
   showUncaughtError: () => boolean;
-  patchEventTarget: (global: any, apis: any[], options?: any) => boolean[];
+  patchEventTarget: (global: any, api: _ZonePrivate, apis: any[], options?: any) => boolean[];
   patchOnProperties: (obj: any, properties: string[]|null, prototype?: any) => void;
   patchThen: (ctro: Function) => void;
-  setNativePromise: (nativePromise: any) => void;
   patchMethod:
       (target: any, name: string,
        patchFn: (delegate: Function, delegateName: string, name: string) =>
@@ -350,6 +359,7 @@ interface _ZonePrivate {
   filterProperties: (target: any, onProperties: string[], ignoreProperties: any[]) => string[];
   attachOriginToPatched: (target: any, origin: any) => void;
   _redefineProperty: (target: any, callback: string, desc: any) => void;
+  nativeScheduleMicroTask: (func: Function) => void;
   patchCallbacks:
       (api: _ZonePrivate, target: any, targetName: string, method: string,
        callbacks: string[]) => void;
@@ -361,7 +371,9 @@ interface _ZonePrivate {
   } | undefined;
 }
 
-/** @internal */
+/**
+ * _ZoneFrame represents zone stack frame information
+ */
 interface _ZoneFrame {
   parent: _ZoneFrame|null;
   zone: Zone;
@@ -372,6 +384,7 @@ interface UncaughtPromiseError extends Error {
   task: Task;
   promise: Promise<any>;
   rejection: any;
+  throwOriginal?: boolean;
 }
 
 /**
@@ -660,8 +673,9 @@ interface EventTask extends Task {
 
 /** @internal */
 type AmbientZone = Zone;
-/** @internal */
-type AmbientZoneDelegate = ZoneDelegate;
+
+/** This local mod is kept in place as global is not available as an ambient type in g3. */
+declare var global: {};
 
 const Zone: ZoneType = (function(global: any) {
   const performance: {mark(name: string): void; measure(name: string, label: string): void;} =
@@ -702,6 +716,7 @@ const Zone: ZoneType = (function(global: any) {
   }
 
   class Zone implements AmbientZone {
+    // tslint:disable-next-line:require-internal-with-underscore
     static __symbol__: (name: string) => string = __symbol__;
 
     static assertZonePatched() {
@@ -731,9 +746,13 @@ const Zone: ZoneType = (function(global: any) {
       return _currentTask;
     }
 
-    static __load_patch(name: string, fn: _PatchFn): void {
+    // tslint:disable-next-line:require-internal-with-underscore
+    static __load_patch(name: string, fn: _PatchFn, ignoreDuplicate = false): void {
       if (patches.hasOwnProperty(name)) {
-        if (checkDuplicate) {
+        // `checkDuplicate` option is defined from global variable
+        // so it works for all modules.
+        // `ignoreDuplicate` can work for the specified module
+        if (!ignoreDuplicate && checkDuplicate) {
           throw Error('Already loaded patch: ' + name);
         }
       } else if (!global['__Zone_disable_' + name]) {
@@ -756,14 +775,14 @@ const Zone: ZoneType = (function(global: any) {
     private _parent: Zone|null;
     private _name: string;
     private _properties: {[key: string]: any};
-    private _zoneDelegate: ZoneDelegate;
+    private _zoneDelegate: _ZoneDelegate;
 
     constructor(parent: Zone|null, zoneSpec: ZoneSpec|null) {
       this._parent = parent;
       this._name = zoneSpec ? zoneSpec.name || 'unnamed' : '<root>';
       this._properties = zoneSpec && zoneSpec.properties || {};
-      this._zoneDelegate =
-          new ZoneDelegate(this, this._parent && this._parent._zoneDelegate, zoneSpec);
+      this._zoneDelegate = new _ZoneDelegate(
+          this, this._parent && this._parent._zoneDelegate, zoneSpec);
     }
 
     public get(key: string): any {
@@ -793,8 +812,8 @@ const Zone: ZoneType = (function(global: any) {
       }
       const _callback = this._zoneDelegate.intercept(this, callback, source);
       const zone: Zone = this;
-      return function() {
-        return zone.runGuarded(_callback, (this as any), <any>arguments, source);
+      return function(this: unknown) {
+        return zone.runGuarded(_callback, this, <any>arguments, source);
       } as any as T;
     }
 
@@ -891,7 +910,7 @@ const Zone: ZoneType = (function(global: any) {
         }
       }
       (task as any as ZoneTask<any>)._transitionTo(scheduling, notScheduled);
-      const zoneDelegates: ZoneDelegate[] = [];
+      const zoneDelegates: _ZoneDelegate[] = [];
       (task as any as ZoneTask<any>)._zoneDelegates = zoneDelegates;
       (task as any as ZoneTask<any>)._zone = this;
       try {
@@ -969,108 +988,115 @@ const Zone: ZoneType = (function(global: any) {
   const DELEGATE_ZS: ZoneSpec = {
     name: '',
     onHasTask:
-        (delegate: AmbientZoneDelegate, _: AmbientZone, target: AmbientZone,
-         hasTaskState: HasTaskState): void => delegate.hasTask(target, hasTaskState),
+        (delegate: ZoneDelegate, _: AmbientZone, target: AmbientZone,
+         hasTaskState: HasTaskState): void =>
+            delegate.hasTask(target, hasTaskState),
     onScheduleTask:
-        (delegate: AmbientZoneDelegate, _: AmbientZone, target: AmbientZone, task: Task): Task =>
-            delegate.scheduleTask(target, task),
+        (delegate: ZoneDelegate, _: AmbientZone, target: AmbientZone,
+         task: Task): Task => delegate.scheduleTask(target, task),
     onInvokeTask:
-        (delegate: AmbientZoneDelegate, _: AmbientZone, target: AmbientZone, task: Task,
-         applyThis: any, applyArgs: any): any =>
+        (delegate: ZoneDelegate, _: AmbientZone, target: AmbientZone,
+         task: Task, applyThis: any, applyArgs: any): any =>
             delegate.invokeTask(target, task, applyThis, applyArgs),
-    onCancelTask: (delegate: AmbientZoneDelegate, _: AmbientZone, target: AmbientZone, task: Task):
-        any => delegate.cancelTask(target, task)
+    onCancelTask:
+        (delegate: ZoneDelegate, _: AmbientZone, target: AmbientZone,
+         task: Task): any => delegate.cancelTask(target, task)
   };
 
-  class ZoneDelegate implements AmbientZoneDelegate {
+  class _ZoneDelegate implements ZoneDelegate {
     public zone: Zone;
 
-    private _taskCounts: {microTask: number,
-                          macroTask: number,
-                          eventTask: number} = {'microTask': 0, 'macroTask': 0, 'eventTask': 0};
+    private _taskCounts:
+        {microTask: number,
+         macroTask: number,
+         eventTask: number} = {'microTask': 0, 'macroTask': 0, 'eventTask': 0};
 
-    private _parentDelegate: ZoneDelegate|null;
+    private _parentDelegate: _ZoneDelegate|null;
 
-    private _forkDlgt: ZoneDelegate|null;
+    private _forkDlgt: _ZoneDelegate|null;
     private _forkZS: ZoneSpec|null;
     private _forkCurrZone: Zone|null;
 
-    private _interceptDlgt: ZoneDelegate|null;
+    private _interceptDlgt: _ZoneDelegate|null;
     private _interceptZS: ZoneSpec|null;
     private _interceptCurrZone: Zone|null;
 
-    private _invokeDlgt: ZoneDelegate|null;
+    private _invokeDlgt: _ZoneDelegate|null;
     private _invokeZS: ZoneSpec|null;
     private _invokeCurrZone: Zone|null;
 
-    private _handleErrorDlgt: ZoneDelegate|null;
+    private _handleErrorDlgt: _ZoneDelegate|null;
     private _handleErrorZS: ZoneSpec|null;
     private _handleErrorCurrZone: Zone|null;
 
-    private _scheduleTaskDlgt: ZoneDelegate|null;
+    private _scheduleTaskDlgt: _ZoneDelegate|null;
     private _scheduleTaskZS: ZoneSpec|null;
     private _scheduleTaskCurrZone: Zone|null;
 
-    private _invokeTaskDlgt: ZoneDelegate|null;
+    private _invokeTaskDlgt: _ZoneDelegate|null;
     private _invokeTaskZS: ZoneSpec|null;
     private _invokeTaskCurrZone: Zone|null;
 
-    private _cancelTaskDlgt: ZoneDelegate|null;
+    private _cancelTaskDlgt: _ZoneDelegate|null;
     private _cancelTaskZS: ZoneSpec|null;
     private _cancelTaskCurrZone: Zone|null;
 
-    private _hasTaskDlgt: ZoneDelegate|null;
-    private _hasTaskDlgtOwner: ZoneDelegate|null;
+    private _hasTaskDlgt: _ZoneDelegate|null;
+    private _hasTaskDlgtOwner: _ZoneDelegate|null;
     private _hasTaskZS: ZoneSpec|null;
     private _hasTaskCurrZone: Zone|null;
 
-    constructor(zone: Zone, parentDelegate: ZoneDelegate|null, zoneSpec: ZoneSpec|null) {
+    constructor(
+        zone: Zone, parentDelegate: _ZoneDelegate|null,
+        zoneSpec: ZoneSpec|null) {
       this.zone = zone;
       this._parentDelegate = parentDelegate;
 
       this._forkZS = zoneSpec && (zoneSpec && zoneSpec.onFork ? zoneSpec : parentDelegate!._forkZS);
       this._forkDlgt = zoneSpec && (zoneSpec.onFork ? parentDelegate : parentDelegate!._forkDlgt);
-      this._forkCurrZone = zoneSpec && (zoneSpec.onFork ? this.zone : parentDelegate!.zone);
+      this._forkCurrZone =
+          zoneSpec && (zoneSpec.onFork ? this.zone : parentDelegate!._forkCurrZone);
 
       this._interceptZS =
           zoneSpec && (zoneSpec.onIntercept ? zoneSpec : parentDelegate!._interceptZS);
       this._interceptDlgt =
           zoneSpec && (zoneSpec.onIntercept ? parentDelegate : parentDelegate!._interceptDlgt);
       this._interceptCurrZone =
-          zoneSpec && (zoneSpec.onIntercept ? this.zone : parentDelegate!.zone);
+          zoneSpec && (zoneSpec.onIntercept ? this.zone : parentDelegate!._interceptCurrZone);
 
       this._invokeZS = zoneSpec && (zoneSpec.onInvoke ? zoneSpec : parentDelegate!._invokeZS);
       this._invokeDlgt =
           zoneSpec && (zoneSpec.onInvoke ? parentDelegate! : parentDelegate!._invokeDlgt);
-      this._invokeCurrZone = zoneSpec && (zoneSpec.onInvoke ? this.zone : parentDelegate!.zone);
+      this._invokeCurrZone =
+          zoneSpec && (zoneSpec.onInvoke ? this.zone : parentDelegate!._invokeCurrZone);
 
       this._handleErrorZS =
           zoneSpec && (zoneSpec.onHandleError ? zoneSpec : parentDelegate!._handleErrorZS);
       this._handleErrorDlgt =
           zoneSpec && (zoneSpec.onHandleError ? parentDelegate! : parentDelegate!._handleErrorDlgt);
       this._handleErrorCurrZone =
-          zoneSpec && (zoneSpec.onHandleError ? this.zone : parentDelegate!.zone);
+          zoneSpec && (zoneSpec.onHandleError ? this.zone : parentDelegate!._handleErrorCurrZone);
 
       this._scheduleTaskZS =
           zoneSpec && (zoneSpec.onScheduleTask ? zoneSpec : parentDelegate!._scheduleTaskZS);
       this._scheduleTaskDlgt = zoneSpec &&
           (zoneSpec.onScheduleTask ? parentDelegate! : parentDelegate!._scheduleTaskDlgt);
       this._scheduleTaskCurrZone =
-          zoneSpec && (zoneSpec.onScheduleTask ? this.zone : parentDelegate!.zone);
+          zoneSpec && (zoneSpec.onScheduleTask ? this.zone : parentDelegate!._scheduleTaskCurrZone);
 
       this._invokeTaskZS =
           zoneSpec && (zoneSpec.onInvokeTask ? zoneSpec : parentDelegate!._invokeTaskZS);
       this._invokeTaskDlgt =
           zoneSpec && (zoneSpec.onInvokeTask ? parentDelegate! : parentDelegate!._invokeTaskDlgt);
       this._invokeTaskCurrZone =
-          zoneSpec && (zoneSpec.onInvokeTask ? this.zone : parentDelegate!.zone);
+          zoneSpec && (zoneSpec.onInvokeTask ? this.zone : parentDelegate!._invokeTaskCurrZone);
 
       this._cancelTaskZS =
           zoneSpec && (zoneSpec.onCancelTask ? zoneSpec : parentDelegate!._cancelTaskZS);
       this._cancelTaskDlgt =
           zoneSpec && (zoneSpec.onCancelTask ? parentDelegate! : parentDelegate!._cancelTaskDlgt);
       this._cancelTaskCurrZone =
-          zoneSpec && (zoneSpec.onCancelTask ? this.zone : parentDelegate!.zone);
+          zoneSpec && (zoneSpec.onCancelTask ? this.zone : parentDelegate!._cancelTaskCurrZone);
 
       this._hasTaskZS = null;
       this._hasTaskDlgt = null;
@@ -1138,9 +1164,10 @@ const Zone: ZoneType = (function(global: any) {
         if (this._hasTaskZS) {
           returnTask._zoneDelegates!.push(this._hasTaskDlgtOwner!);
         }
-        returnTask = this._scheduleTaskZS.onScheduleTask!
-                     (this._scheduleTaskDlgt!, this._scheduleTaskCurrZone!, targetZone, task) as
-            ZoneTask<any>;
+        // clang-format off
+        returnTask = this._scheduleTaskZS.onScheduleTask !(
+            this._scheduleTaskDlgt !, this._scheduleTaskCurrZone !, targetZone, task) as ZoneTask<any>;
+        // clang-format on
         if (!returnTask) returnTask = task as ZoneTask<any>;
       } else {
         if (task.scheduleFn) {
@@ -1187,6 +1214,7 @@ const Zone: ZoneType = (function(global: any) {
       }
     }
 
+    // tslint:disable-next-line:require-internal-with-underscore
     _updateTaskCount(type: TaskType, count: number) {
       const counts = this._taskCounts;
       const prev = counts[type];
@@ -1214,9 +1242,12 @@ const Zone: ZoneType = (function(global: any) {
     public data: TaskData|undefined;
     public scheduleFn: ((task: Task) => void)|undefined;
     public cancelFn: ((task: Task) => void)|undefined;
+    // tslint:disable-next-line:require-internal-with-underscore
     _zone: Zone|null = null;
     public runCount: number = 0;
-    _zoneDelegates: ZoneDelegate[]|null = null;
+    // tslint:disable-next-line:require-internal-with-underscore
+    _zoneDelegates: _ZoneDelegate[]|null = null;
+    // tslint:disable-next-line:require-internal-with-underscore
     _state: TaskState = 'notScheduled';
 
     constructor(
@@ -1227,6 +1258,9 @@ const Zone: ZoneType = (function(global: any) {
       this.data = options;
       this.scheduleFn = scheduleFn;
       this.cancelFn = cancelFn;
+      if (!callback) {
+        throw new Error('callback is not defined');
+      }
       this.callback = callback;
       const self = this;
       // TODO: @JiaLiPassion options should have interface
@@ -1267,6 +1301,7 @@ const Zone: ZoneType = (function(global: any) {
       this._transitionTo(notScheduled, scheduling);
     }
 
+    // tslint:disable-next-line:require-internal-with-underscore
     _transitionTo(toState: TaskState, fromState1: TaskState, fromState2?: TaskState) {
       if (this._state === fromState1 || this._state === fromState2) {
         this._state = toState;
@@ -1314,27 +1349,31 @@ const Zone: ZoneType = (function(global: any) {
   let _isDrainingMicrotaskQueue: boolean = false;
   let nativeMicroTaskQueuePromise: any;
 
+  function nativeScheduleMicroTask(func: Function) {
+    if (!nativeMicroTaskQueuePromise) {
+      if (global[symbolPromise]) {
+        nativeMicroTaskQueuePromise = global[symbolPromise].resolve(0);
+      }
+    }
+    if (nativeMicroTaskQueuePromise) {
+      let nativeThen = nativeMicroTaskQueuePromise[symbolThen];
+      if (!nativeThen) {
+        // native Promise is not patchable, we need to use `then` directly
+        // issue 1078
+        nativeThen = nativeMicroTaskQueuePromise['then'];
+      }
+      nativeThen.call(nativeMicroTaskQueuePromise, func);
+    } else {
+      global[symbolSetTimeout](func, 0);
+    }
+  }
+
   function scheduleMicroTask(task?: MicroTask) {
     // if we are not running in any task, and there has not been anything scheduled
     // we must bootstrap the initial task creation by manually scheduling the drain
     if (_numberOfNestedTaskFrames === 0 && _microTaskQueue.length === 0) {
       // We are not running in Task, so we need to kickstart the microtask queue.
-      if (!nativeMicroTaskQueuePromise) {
-        if (global[symbolPromise]) {
-          nativeMicroTaskQueuePromise = global[symbolPromise].resolve(0);
-        }
-      }
-      if (nativeMicroTaskQueuePromise) {
-        let nativeThen = nativeMicroTaskQueuePromise[symbolThen];
-        if (!nativeThen) {
-          // native Promise is not patchable, we need to use `then` directly
-          // issue 1078
-          nativeThen = nativeMicroTaskQueuePromise['then'];
-        }
-        nativeThen.call(nativeMicroTaskQueuePromise, drainMicroTaskQueue);
-      } else {
-        global[symbolSetTimeout](drainMicroTaskQueue, 0);
-      }
+      nativeScheduleMicroTask(drainMicroTaskQueue);
     }
     task && _microTaskQueue.push(task);
   }
@@ -1387,14 +1426,6 @@ const Zone: ZoneType = (function(global: any) {
     bindArguments: () => [],
     patchThen: () => noop,
     patchMacroTask: () => noop,
-    setNativePromise: (NativePromise: any) => {
-      // sometimes NativePromise.resolve static function
-      // is not ready yet, (such as core-js/es6.promise)
-      // so we need to check here.
-      if (NativePromise && typeof NativePromise.resolve === 'function') {
-        nativeMicroTaskQueuePromise = NativePromise.resolve(0);
-      }
-    },
     patchEventPrototype: () => noop,
     isIEOrEdge: () => false,
     getGlobalObjects: () => undefined,
@@ -1407,7 +1438,8 @@ const Zone: ZoneType = (function(global: any) {
     filterProperties: () => [],
     attachOriginToPatched: () => noop,
     _redefineProperty: () => noop,
-    patchCallbacks: () => noop
+    patchCallbacks: () => noop,
+    nativeScheduleMicroTask: nativeScheduleMicroTask
   };
   let _currentZoneFrame: _ZoneFrame = {parent: null, zone: new Zone(null, null)};
   let _currentTask: Task|null = null;
@@ -1417,4 +1449,4 @@ const Zone: ZoneType = (function(global: any) {
 
   performanceMeasure('Zone', 'Zone');
   return global['Zone'] = Zone;
-})(global);
+})(typeof window !== 'undefined' && window || typeof self !== 'undefined' && self || global);
